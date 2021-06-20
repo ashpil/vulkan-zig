@@ -194,6 +194,7 @@ fn Renderer(comptime WriterType: type) type {
             bitflags,
             mut_buffer_len,
             buffer_len,
+            handle,
             other,
         };
 
@@ -315,7 +316,7 @@ fn Renderer(comptime WriterType: type) type {
             const tagless_name = if (tag) |tag_name| name[0 .. name.len - tag_name.len] else name;
 
             // Strip out the "version" number of a bitflag, like VkAccessFlagBits2KHR.
-            const base_name = std.mem.trimRight(u8, tagless_name, "0123456789");
+            const base_name = mem.trimRight(u8, tagless_name, "0123456789");
 
             const maybe_flag_bits_index = mem.lastIndexOf(u8, base_name, "FlagBits");
             if (maybe_flag_bits_index == null) {
@@ -384,6 +385,9 @@ fn Renderer(comptime WriterType: type) type {
         }
 
         fn classifyParam(self: Self, param: reg.Command.Param) !ParamType {
+            if (mem.eql(u8, param.name, "instance") or mem.eql(u8, param.name, "device")) {
+                return .handle;
+            }
             switch (param.param_type) {
                 .pointer => |ptr| {
                     if (param.is_buffer_len) {
@@ -1307,7 +1311,6 @@ fn Renderer(comptime WriterType: type) type {
             try self.writer.print(
                 \\pub fn {0s}Wrapper(comptime apis: []const ApiInfo) type {{
                 \\    return struct {{
-                \\        dispatch: Dispatch,
                 \\
                 \\        const Self = @This();
                 \\        pub const commands = blk: {{
@@ -1317,7 +1320,7 @@ fn Renderer(comptime WriterType: type) type {
                 \\            }}
                 \\            break :blk cmds;
                 \\        }};
-                \\        pub const Dispatch = blk: {{
+                \\        pub const DispatchTable = blk: {{
                 \\            @setEvalBranchQuota(10_000);
                 \\            const Type = std.builtin.Type;
                 \\            const fields_len = fields_len: {{
@@ -1355,6 +1358,7 @@ fn Renderer(comptime WriterType: type) type {
                 \\
             , .{ name, name_lower });
 
+            try self.renderWrapperFields(dispatch_type);
             try self.renderWrapperLoader(dispatch_type);
 
             for (self.registry.decls) |decl| {
@@ -1379,6 +1383,22 @@ fn Renderer(comptime WriterType: type) type {
             try self.writer.writeAll("};}\n");
         }
 
+        fn renderWrapperFields(self: *Self, dispatch_type: CommandDispatchType) !void {
+            const field = switch (dispatch_type) {
+                .base => "",
+                .instance => "handle: Instance,\n",
+                .device => "handle: Device,\n",
+            };
+
+            @setEvalBranchQuota(2000);
+
+            try self.writer.print(
+                \\
+                \\dispatch: DispatchTable,
+                \\{s}
+            , .{ field });
+        }
+
         fn renderWrapperLoader(self: *Self, dispatch_type: CommandDispatchType) !void {
             const params = switch (dispatch_type) {
                 .base => "loader: anytype",
@@ -1392,28 +1412,36 @@ fn Renderer(comptime WriterType: type) type {
                 .device => "device",
             };
 
+            const handle = switch (dispatch_type) {
+                .base => "",
+                .instance => "self.handle = instance;\n",
+                .device => "self.handle = device;\n",
+            };
+
             @setEvalBranchQuota(2000);
 
             try self.writer.print(
                 \\pub fn load({[params]s}) error{{CommandLoadFailure}}!Self {{
                 \\    var self: Self = undefined;
-                \\    inline for (std.meta.fields(Dispatch)) |field| {{
+                \\    {[handle]s}
+                \\    inline for (std.meta.fields(DispatchTable)) |field| {{
                 \\        const name: [*:0]const u8 = @ptrCast(field.name ++ "\x00");
                 \\        const cmd_ptr = loader({[first_arg]s}, name) orelse return error.CommandLoadFailure;
                 \\        @field(self.dispatch, field.name) = @ptrCast(cmd_ptr);
                 \\    }}
                 \\    return self;
                 \\}}
+                \\
                 \\pub fn loadNoFail({[params]s}) Self {{
                 \\    var self: Self = undefined;
-                \\    inline for (std.meta.fields(Dispatch)) |field| {{
+                \\    inline for (std.meta.fields(DispatchTable)) |field| {{
                 \\        const name: [*:0]const u8 = @ptrCast(field.name ++ "\x00");
                 \\        const cmd_ptr = loader({[first_arg]s}, name) orelse undefined;
                 \\        @field(self.dispatch, field.name) = @ptrCast(cmd_ptr);
                 \\    }}
                 \\    return self;
                 \\}}
-            , .{ .params = params, .first_arg = loader_first_arg });
+            , .{ .params = params, .handle = handle, .first_arg = loader_first_arg });
         }
 
         fn derefName(name: []const u8) []const u8 {
@@ -1429,9 +1457,15 @@ fn Renderer(comptime WriterType: type) type {
             try self.writeIdentifierWithCase(.camel, trimVkNamespace(name));
             try self.writer.writeAll("(self: Self, ");
 
+            if (mem.eql(u8, name, "vkCreateInstance") or mem.eql(u8, name, "vkCreateDevice")) {
+                try self.writer.writeAll("comptime Dispatch: type, ");
+                try self.writer.writeAll("loader: anytype, ");
+            }
+
             for (command.params) |param| {
-                // This parameter is returned instead.
-                if ((try self.classifyParam(param)) == .out_pointer) {
+
+                const param_type = try self.classifyParam(param);
+                if (param_type == .out_pointer or param_type == .handle) {
                     continue;
                 }
 
@@ -1444,12 +1478,16 @@ fn Renderer(comptime WriterType: type) type {
             try self.writer.writeAll(") ");
 
             const returns_vk_result = command.return_type.* == .name and mem.eql(u8, command.return_type.name, "VkResult");
-            if (returns_vk_result) {
+            if (mem.eql(u8, name, "vkCreateInstance") or mem.eql(u8, name, "vkCreateDevice")) {
+                try self.writer.writeByte('!');
+            } else if (returns_vk_result) {
                 try self.renderErrorSetName(name);
                 try self.writer.writeByte('!');
             }
 
-            if (returns.len == 1) {
+            if (mem.eql(u8, name, "vkCreateInstance") or mem.eql(u8, name, "vkCreateDevice")) {
+                try self.writer.writeAll("Dispatch");
+            } else if (returns.len == 1) {
                 try self.renderTypeInfo(returns[0].return_value_type);
             } else if (returns.len > 1) {
                 try self.renderReturnStructName(name);
@@ -1471,6 +1509,7 @@ fn Renderer(comptime WriterType: type) type {
 
             for (command.params) |param| {
                 switch (try self.classifyParam(param)) {
+                    .handle => try self.writer.writeAll("self.handle"),
                     .out_pointer => {
                         try self.writer.writeByte('&');
                         try self.writeIdentifierWithCase(.snake, return_var_name.?);
@@ -1628,9 +1667,15 @@ fn Renderer(comptime WriterType: type) type {
             }
 
             if (returns.len >= 1) {
-                try self.writer.writeAll("return ");
-                try self.writeIdentifierWithCase(.snake, return_var_name);
-                try self.writer.writeAll(";\n");
+                if (mem.eql(u8, name, "vkCreateInstance")) {
+                    try self.writer.writeAll("return try Dispatch.load(out_instance, loader);");
+                } else if (mem.eql(u8, name, "vkCreateDevice")) {
+                    try self.writer.writeAll("return try Dispatch.load(out_device, loader);");
+                } else {
+                    try self.writer.writeAll("return ");
+                    try self.writeIdentifierWithCase(.snake, return_var_name);
+                    try self.writer.writeAll(";\n");
+                }
             }
 
             try self.writer.writeAll("}\n");
